@@ -54,8 +54,10 @@ def epoch_ms_expr(name):
     s = pl.col(name)
     text = s.str.to_datetime(format="%+", time_unit="ms", time_zone="UTC", strict=False)
     digits = s.str.contains(r"^[0-9]+$")
+    # The datetime parser accepts leap seconds, but the input rules reject :60.
     iso = s.str.contains(
-        r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$"
+        r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+        r"(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$"
     )
     return pl.when(digits).then(s.cast(pl.Int64, strict=False)).when(iso).then(text.cast(pl.Int64, strict=False)).otherwise(None)
 
