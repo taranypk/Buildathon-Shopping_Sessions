@@ -1,0 +1,48 @@
+name: Public dev validation
+on:
+  push:
+    branches: [codex/dev-timestamp-check]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Generate the official dev set and build the pipeline
+        shell: bash
+        run: |
+          base=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for file in generator.zip dev-answer.zip starter-polars.zip; do
+            curl --fail --silent --show-error --location --retry 2 -o "$file" "$base/$file"
+          done
+          sha256sum --check <<'CHECKSUMS'
+          78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip
+          c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip
+          0faa7a2cb78f78682f606f88748cdf7290622db2ee55a71261091f3e01392d60  starter-polars.zip
+          CHECKSUMS
+          for archive in generator.zip dev-answer.zip starter-polars.zip; do unzip -q "$archive"; done
+          cargo run --manifest-path generator/Cargo.toml --release -- --seed 1 --events 1000000 --clicks 250000 --output dev
+          docker build --platform linux/amd64 -t shopping-dev-check .
+      - name: Reproduce the public dev mismatch
+        shell: bash
+        run: |
+          git show HEAD^:pipeline/pipeline.py > baseline.py
+          mkdir -p baseline-out
+          docker run --rm --network none -e NCPU=4 -e SCRATCH_DIR=/tmp -v "$PWD:/work" -e DATA_DIR=/work/dev -e OUTPUT_DIR=/work/baseline-out --entrypoint python3 shopping-dev-check /work/baseline.py
+          if docker run --rm --network none -v "$PWD:/work:ro" --entrypoint python3 shopping-dev-check /work/scripts/compare.py /work/baseline-out /work/dev-answer; then
+            echo 'Baseline unexpectedly matched the public dev answer.'
+          fi
+      - name: Compare corrected outputs with the public dev answer
+        shell: bash
+        run: |
+          mkdir -p fixed-out
+          docker run --rm --network none -e NCPU=4 -e SCRATCH_DIR=/tmp -v "$PWD:/work" -e DATA_DIR=/work/dev -e OUTPUT_DIR=/work/fixed-out shopping-dev-check
+          docker run --rm --network none -v "$PWD:/work:ro" --entrypoint python3 shopping-dev-check /work/scripts/compare.py /work/fixed-out /work/dev-answer
+      - name: Check starter fixtures
+        shell: bash
+        run: |
+          docker run --rm --network none -e NCPU=4 -e SCRATCH_DIR=/tmp -v "$PWD:/work:ro" --entrypoint python3 shopping-dev-check /work/scripts/run_fixtures.py /work/starter-polars/fixtures -- python3 /app/pipeline/pipeline.py
