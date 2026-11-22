@@ -1,31 +1,18 @@
-# Shopping Sessions builds on linux/amd64 for the scorer.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
-FROM gcc:14-bookworm AS csvfilter-build
-COPY pipeline/csv_filter.c /tmp/csv_filter.c
-COPY pipeline/attribution.c /tmp/attribution.c
-RUN gcc -O3 -pipe -o /usr/local/bin/csv_filter /tmp/csv_filter.c \
-    && gcc -O3 -pipe -shared -fPIC -o /usr/local/lib/libshopping_attribution.so /tmp/attribution.c
+FROM gcc:14-bookworm AS build
+WORKDIR /src
+COPY pipeline/attribution.c pipeline/input.hpp pipeline/shopping.cpp ./
+RUN gcc -O3 -std=c11 -c attribution.c -o attribution.o \
+    && g++ -O3 -std=c++20 -DNDEBUG -pthread -static-libstdc++ -static-libgcc \
+       shopping.cpp attribution.o -o /usr/local/bin/shopping
 
 FROM python:3.12-slim-bookworm
-
-# The scorer runs the container as uid 1000; give that uid a name and a home.
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY --from=csvfilter-build /usr/local/bin/csv_filter /usr/local/bin/csv_filter
-COPY --from=csvfilter-build /usr/local/lib/libshopping_attribution.so /usr/local/lib/
-COPY pipeline/ /app/pipeline/
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=build /usr/local/bin/shopping /usr/local/bin/shopping
+COPY pipeline/pipeline.py /app/pipeline/pipeline.py
 COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh
-
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 CMD ["/app/run.sh"]
