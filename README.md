@@ -1,4 +1,3 @@
-Warning: fs was declared with const; use let for reassignable variables.
 # Shopping Sessions
 
 This submission reads the CSV inputs under `DATA_DIR` (default `/data`) and writes the exact daily Parquet outputs under `OUTPUT_DIR` (default `/output`). It targets the shopping-session rules in [`rules.md`](rules.md).
