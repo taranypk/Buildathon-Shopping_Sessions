@@ -1,9 +1,11 @@
-# Shopping Sessions starter: Polars skeleton.
+# Shopping Sessions builds on linux/amd64 for the scorer.
 # The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
 # no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
 FROM gcc:14-bookworm AS csvfilter-build
 COPY pipeline/csv_filter.c /tmp/csv_filter.c
-RUN gcc -O3 -pipe -o /usr/local/bin/csv_filter /tmp/csv_filter.c
+COPY pipeline/attribution.c /tmp/attribution.c
+RUN gcc -O3 -pipe -o /usr/local/bin/csv_filter /tmp/csv_filter.c \
+    && gcc -O3 -pipe -shared -fPIC -o /usr/local/lib/libshopping_attribution.so /tmp/attribution.c
 
 FROM python:3.12-slim-bookworm
 
@@ -14,6 +16,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY --from=csvfilter-build /usr/local/bin/csv_filter /usr/local/bin/csv_filter
+COPY --from=csvfilter-build /usr/local/lib/libshopping_attribution.so /usr/local/lib/
 COPY pipeline/ /app/pipeline/
 COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh

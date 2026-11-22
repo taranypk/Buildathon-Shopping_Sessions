@@ -2,7 +2,7 @@
 
 This submission reads the CSV inputs under `DATA_DIR` (default `/data`) and writes the exact daily Parquet outputs under `OUTPUT_DIR` (default `/output`). It targets the shopping-session rules in [`rules.md`](rules.md).
 
-The pipeline uses a small C validator to enforce the LF-only CSV dialect and discard malformed rows, then Polars for parsing, grouping, sessionization, attribution, and Parquet output. Temporary normalized CSVs are written under `SCRATCH_DIR` (default `/scratch`). The image builds for `linux/amd64` and needs no network at runtime.
+The pipeline validates the LF-only CSV dialect, then uses Polars to deduplicate records and build sessions. Larger inputs are split by record ID for deduplication and by linked person for sessionization. Campaign attribution counts assists over merged click windows. Temporary partitions are written under `SCRATCH_DIR` (default `/scratch`). The image builds for `linux/amd64` and needs no network at runtime.
 
 ## Build and run
 
