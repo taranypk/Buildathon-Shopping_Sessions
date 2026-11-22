@@ -67,16 +67,27 @@ jobs:
           docker run --rm --network none -e NCPU=4 -e SCRATCH_DIR=/tmp \
             -v "$RUNNER_TEMP/starter-polars/fixtures:/fixtures:ro" -v "$PWD/scripts:/checks:ro" \
             --entrypoint python3 shopping-memory-check /checks/run_fixtures.py /fixtures -- python3 /app/pipeline/pipeline.py
-      - name: Compare scored and native pipelines on identical practice input
+      - name: Compare native candidates on identical practice input
         if: matrix.name == 'practice-scale'
         shell: bash
         run: |
           mkdir "$RUNNER_TEMP/scored-src" "$RUNNER_TEMP/scored-output" "$RUNNER_TEMP/scored-scratch"
-          git archive 5646ee4e284143d42b0e4e30aa597f97130921d4 | tar -x -C "$RUNNER_TEMP/scored-src"
+          git archive 2cfc79e2ca898c041c033598c1f68a66d8b98f5f | tar -x -C "$RUNNER_TEMP/scored-src"
           docker build -t shopping-scored "$RUNNER_TEMP/scored-src"
           cd "$RUNNER_TEMP"
           /usr/bin/time -f 'baseline_container_wall_seconds=%e' docker run --rm --network none --cpus 4 --memory 12g --memory-swap 12g -e NCPU=4 -v "$PWD/data:/data:ro" -v "$PWD/scored-output:/output" -v "$PWD/scored-scratch:/scratch" shopping-scored
           docker run --rm --network none -v "$RUNNER_TEMP:/inputs:ro" -v "$GITHUB_WORKSPACE/scripts:/checks:ro" --entrypoint python3 shopping-memory-check /checks/compare.py /inputs/output /inputs/scored-output
+      - name: Repeat entrypoint timings with the same cached input
+        if: matrix.name == 'practice-scale'
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          for img in shopping-memory-check shopping-scored shopping-memory-check; do
+            printf '%s ' "$img"
+            docker run --rm --network none --cpus 4 --memory 12g --memory-swap 12g -e NCPU=4 \
+              -v "$PWD/data:/data:ro" --tmpfs /output --tmpfs /scratch \
+              --entrypoint python3 "$img" -c 'import subprocess,time; start=time.perf_counter(); subprocess.run(["/app/run.sh"],check=True); print("entrypoint_seconds=",round(time.perf_counter()-start,4))'
+          done
       - name: Reconcile both output tables
         if: matrix.name != 'public-dev'
         shell: bash

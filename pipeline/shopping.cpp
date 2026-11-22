@@ -86,7 +86,9 @@ struct RepeatFilter {
     }
 };
 
-struct Event { int64_t time; uint32_t person, price, category; };
+struct Event { int64_t time; uint32_t person, purchase; };
+static_assert(sizeof(Event)==16);
+struct Purchase { uint32_t price, category; };
 struct Click { int64_t time; Text id; uint32_t person, campaign; };
 struct Candidate { Text id; Event event; int64_t ingest; uint64_t hash; };
 
@@ -94,6 +96,7 @@ struct Reader {
     Dictionary users;
     Calendar calendar;
     Blocks<Event> events;
+    std::vector<Purchase> purchases;
     Blocks<Click> clicks;
     std::array<Blocks<Candidate>,BANKS> candidates;
     std::vector<uint32_t> canonical;
@@ -144,8 +147,8 @@ void read_events(Reader& r, int worker, Chunk chunk, const Catalogs& catalogs,
         bool check = repeats.possible_duplicate(hash);
         bool purchase = f[4] == "purchase";
         int64_t time = r.calendar.timestamp(f[2]);
-        int64_t ingest = r.calendar.timestamp(f[3]);
-        Event event{time,NONE,0,catalogs.unknown};
+        int64_t ingest = r.calendar.ingest(f[3]);
+        Event event{time,NONE,NONE};
         bool valid = !f[1].empty() && !f[5].empty() && time >= start && time < end &&
                      ingest != INVALID && ingest - time <= DAY_MS &&
                      (purchase || f[4] == "cart" || f[4] == "view");
@@ -153,12 +156,13 @@ void read_events(Reader& r, int worker, Chunk chunk, const Catalogs& catalogs,
             int64_t price = unsigned_number(f[6]);
             valid = price >= 1 && price <= 10000000;
             if (valid) {
-                event.price = uint32_t(price);
                 uint32_t product = catalogs.products.lookup(f[5]);
-                if (product != NONE) event.category = catalogs.product_category[product];
+                uint32_t cat = product == NONE ? catalogs.unknown : catalogs.product_category[product];
+                event.purchase = uint32_t(r.purchases.size()*8 + worker);
+                r.purchases.push_back({uint32_t(price),cat});
             }
         }
-        if (valid) event.person = r.users.intern(f[1]) * workers + worker;
+        if (valid) event.person = r.users.intern(f[1]) * 8 + worker;
         if (check) r.candidates[hash % BANKS].add({f[0],event,ingest,hash});
         else if (valid) r.events.add(event);
     });
@@ -210,6 +214,7 @@ struct UserRow {
     uint32_t sessions = 0, events = 0, category = NONE, reserved = 0;
 };
 static_assert(sizeof(UserRow)==32);
+#include "output.hpp"
 inline int64_t utc_day(int64_t ms) { return ms/DAY_MS - (ms%DAY_MS<0); }
 
 struct Daily {
@@ -237,39 +242,21 @@ struct Daily {
         if (row.events && (day != row.day || person != row.person)) finish();
         row.day = day; row.person = person; ++row.sessions;
     }
-    void event(Event e) {
+    void event(Purchase purchase) {
         ++row.events;
-        if (e.price) {
-            row.revenue += e.price;
-            if (amounts[e.category] == 0) touched.push_back(e.category);
-            amounts[e.category] += e.price;
+        if (purchase.price) {
+            row.revenue += purchase.price;
+            if (amounts[purchase.category] == 0) touched.push_back(purchase.category);
+            amounts[purchase.category] += purchase.price;
         }
     }
 };
 
-void write_binary(const fs::path& name,const void* data,size_t bytes) {
-    FILE* f = fopen(name.c_str(),"wb");
-    if (!f) throw std::runtime_error("cannot create "+name.string());
-    bool ok = !bytes || fwrite(data,1,bytes,f)==bytes;
-    if (fclose(f) || !ok) throw std::runtime_error("cannot write "+name.string());
-}
-void write_names(const fs::path& path, const std::vector<Text>& names) {
-    FILE* f = fopen(path.c_str(),"wb");
-    if (!f) throw std::runtime_error("cannot write dictionary");
-    for (auto name : names) {
-        fputc('"',f);
-        fwrite(name.data(),1,name.size(),f);
-        fputs("\"\n",f);
-    }
-    bool ok = !ferror(f);
-    if (fclose(f) || !ok) throw std::runtime_error("dictionary write failed");
-}
-
-void aggregate(size_t bank, std::vector<Shards>& shards, size_t people,
+void aggregate(size_t bank, std::vector<Shards>& shards, const Dictionary& people,
                const Catalogs& catalogs, int64_t first_day, size_t days,
-               std::vector<int64_t>& totals, const fs::path& out) {
-    auto [events, eoff] = group_by_person(&Shards::events,shards,bank,people);
-    auto [clicks, coff] = group_by_person(&Shards::clicks,shards,bank,people);
+               std::vector<int64_t>& totals, const std::vector<Reader>& readers, const fs::path& out) {
+    auto [events, eoff] = group_by_person(&Shards::events,shards,bank,people.names.size());
+    auto [clicks, coff] = group_by_person(&Shards::clicks,shards,bank,people.names.size());
     Daily daily(catalogs.categories);
     std::vector<int64_t> st, revenue, ct;
     std::vector<uint32_t> sp, cp, campaign;
@@ -284,8 +271,11 @@ void aggregate(size_t bank, std::vector<Shards>& shards, size_t people,
                 st.push_back(i->time); sp.push_back(person); revenue.push_back(0);
                 daily.session(person,i->time);
             }
-            previous = i->time; revenue.back() += i->price;
-            daily.event(*i);
+            previous = i->time;
+            Purchase purchase{};
+            if (i->purchase != NONE) purchase = readers[i->purchase%8].purchases[i->purchase/8];
+            revenue.back() += purchase.price;
+            daily.event(purchase);
         }
         daily.finish();
         auto begin = clicks.begin()+coff[group], end = clicks.begin()+coff[group+1];
@@ -301,15 +291,18 @@ void aggregate(size_t bank, std::vector<Shards>& shards, size_t people,
                          ct.data(),campaign.data(),catalogs.campaigns.names.size(),
                          first_day,days,totals.data());
     if (code) throw std::runtime_error("attribution failed");
-    if (!daily.output.empty())
-        write_binary(out/("users-"+std::to_string(bank)+".bin"),daily.output.data(),daily.output.size()*sizeof(UserRow));
+    if (bank==0 || !daily.output.empty())
+        write_users(out/"user_daily"/("part-"+std::to_string(bank)+".parquet"),
+                    daily.output,people,catalogs.categories);
 }
 
 int main(int argc,char** argv) try {
-    if (argc != 6) throw std::runtime_error("expected data, scratch, start_ms, end_ms, workers");
+    if (argc != 6) throw std::runtime_error("expected data, output, start_ms, end_ms, workers");
     fs::path data=argv[1], out=argv[2];
     int64_t start=std::stoll(argv[3]), end=std::stoll(argv[4]);
     workers=std::clamp(std::stoi(argv[5]),1,8);
+    fs::create_directories(out/"user_daily");
+    fs::create_directories(out/"campaign_daily");
     auto began=std::chrono::steady_clock::now();
     auto stage=[&](const char* name){
         std::cerr<<name<<" elapsed_seconds="<<std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count()<<'\n';
@@ -339,7 +332,7 @@ int main(int argc,char** argv) try {
             int64_t t=r.calendar.timestamp(f[3]);
             if (t<start-7*DAY_MS || t>=end) return;
             uint32_t c=catalogs.campaigns.lookup(f[2]);
-            if (c!=NONE) r.clicks.add({t,f[0],uint32_t(r.users.intern(f[1])*workers+w),c});
+            if (c!=NONE) r.clicks.add({t,f[0],uint32_t(r.users.intern(f[1])*8+w),c});
         });
     });
     for (auto chunk:links.chunks) parse_chunk<2>(chunk,[&](auto& f){people.join(f[0],f[1]);});
@@ -351,7 +344,7 @@ int main(int argc,char** argv) try {
     stage("resolved users and clicks");
     std::vector<Shards> shards(workers);
     auto route=[&](auto row,auto& dest){
-        row.person=readers[row.person%workers].canonical[row.person/workers];
+        row.person=readers[row.person%8].canonical[row.person/8];
         dest[row.person%BANKS].add(row);
     };
     parallel(workers,[&](int,size_t i){
@@ -364,17 +357,12 @@ int main(int argc,char** argv) try {
     size_t metrics=(catalogs.campaigns.names.size()+1)*days*4;
     std::vector<std::vector<int64_t>> totals(workers,std::vector<int64_t>(metrics));
     parallel(BANKS,[&](int w,size_t bank){
-        aggregate(bank,shards,people.ids.names.size(),catalogs,first_day,days,totals[w],out);
+        aggregate(bank,shards,people.ids,catalogs,first_day,days,totals[w],readers,out);
     });
     for(int w=1;w<workers;++w)
         for(size_t k=0;k<metrics;++k) totals[0][k]+=totals[w][k];
-    write_binary(out/"campaign.bin",totals[0].data(),metrics*sizeof(int64_t));
-    write_names(out/"people.csv",people.ids.names);
-    write_names(out/"categories.csv",catalogs.categories.names);
-    auto ids=catalogs.campaigns.names, channels=catalogs.channels;
-    ids.push_back("organic"); channels.push_back("organic");
-    write_names(out/"campaigns.csv",ids);
-    write_names(out/"channels.csv",channels);
-    stage("aggregated");
+    write_campaigns(out/"campaign_daily"/"part-0.parquet",catalogs,first_day,days,totals[0]);
+    std::cout<<"pipeline_seconds="
+             <<std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count()<<'\n';
     return 0;
 } catch(const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
