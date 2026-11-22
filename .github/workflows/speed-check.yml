@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           mkdir "$RUNNER_TEMP/scored-src" "$RUNNER_TEMP/scored-output" "$RUNNER_TEMP/scored-scratch"
-          git archive 2cfc79e2ca898c041c033598c1f68a66d8b98f5f | tar -x -C "$RUNNER_TEMP/scored-src"
+          git archive f6b7f85eda38ff562dba14a7e02f2b21a9667084 | tar -x -C "$RUNNER_TEMP/scored-src"
           docker build -t shopping-scored "$RUNNER_TEMP/scored-src"
           cd "$RUNNER_TEMP"
           /usr/bin/time -f 'baseline_container_wall_seconds=%e' docker run --rm --network none --cpus 4 --memory 12g --memory-swap 12g -e NCPU=4 -v "$PWD/data:/data:ro" -v "$PWD/scored-output:/output" -v "$PWD/scored-scratch:/scratch" shopping-scored

@@ -92,13 +92,20 @@ struct Purchase { uint32_t price, category; };
 struct Click { int64_t time; Text id; uint32_t person, campaign; };
 struct Candidate { Text id; Event event; int64_t ingest; uint64_t hash; };
 
+struct Shards {
+    std::array<Blocks<Event>,BANKS> events;
+    std::array<Blocks<Click>,BANKS> clicks;
+};
+
 struct Reader {
     Dictionary users;
     Calendar calendar;
-    Blocks<Event> events;
+    Shards shards;
     std::vector<Purchase> purchases;
-    Blocks<Click> clicks;
     std::array<Blocks<Candidate>,BANKS> candidates;
+    std::array<std::vector<uint32_t>,BANKS> ids_by_bank;
+    std::vector<Text> names;
+    std::vector<uint8_t> banks;
     std::vector<uint32_t> canonical;
 };
 
@@ -139,8 +146,23 @@ struct Catalogs {
     }
 };
 
+// Route aliases of one person to the same bank on their first appearance
+// in this reader. Final person codes are assigned concurrently within banks.
+uint32_t local_user(Reader& reader, Text name, const People& links) {
+    uint32_t id=reader.users.intern(name);
+    if (id == reader.names.size()) {
+        uint32_t linked=links.ids.lookup(name);
+        Text canonical=linked==NONE ? name : links.ids.names[links.parent[linked]];
+        uint8_t bank=hash_text(canonical)%BANKS;
+        reader.names.push_back(canonical);
+        reader.banks.push_back(bank);
+        reader.ids_by_bank[bank].push_back(id);
+    }
+    return id;
+}
+
 void read_events(Reader& r, int worker, Chunk chunk, const Catalogs& catalogs,
-                 const RepeatFilter& repeats, int64_t start, int64_t end) {
+                 const People& links, const RepeatFilter& repeats, int64_t start, int64_t end) {
     parse_chunk<7>(chunk,[&](auto& f) {
         if (f[0].empty()) return;
         uint64_t hash = hash_text(f[0]);
@@ -162,9 +184,9 @@ void read_events(Reader& r, int worker, Chunk chunk, const Catalogs& catalogs,
                 r.purchases.push_back({uint32_t(price),cat});
             }
         }
-        if (valid) event.person = r.users.intern(f[1]) * 8 + worker;
+        if (valid) event.person = local_user(r,f[1],links) * 8 + worker;
         if (check) r.candidates[hash % BANKS].add({f[0],event,ingest,hash});
-        else if (valid) r.events.add(event);
+        else if (valid) r.shards.events[r.banks[event.person/8]].add(event);
     });
 }
 
@@ -179,29 +201,29 @@ void dedup(size_t bank, Reader& dest, std::vector<Reader>& readers) {
             if (!table[pos] || table[pos]->ingest > row.ingest) table[pos] = &row;
         });
     }
-    for (auto row : table) if (row && row->event.person != NONE) dest.events.add(row->event);
+    for (auto row : table) if (row && row->event.person != NONE) {
+        uint32_t handle=row->event.person;
+        dest.shards.events[readers[handle%8].banks[handle/8]].add(row->event);
+    }
     for (auto& r : readers) r.candidates[bank].clear();
 }
 
-struct Shards {
-    std::array<Blocks<Event>,BANKS> events;
-    std::array<Blocks<Click>,BANKS> clicks;
-};
-
 template<typename T>
 std::pair<std::vector<T>,std::vector<size_t>>
-group_by_person(std::array<Blocks<T>,BANKS> Shards::*member, std::vector<Shards>& sources,
+group_by_person(std::array<Blocks<T>,BANKS> Shards::*member, std::vector<Reader>& sources,
                 size_t bank, size_t person_count) {
-    size_t groups = (person_count + BANKS - 1) / BANKS;
-    std::vector<size_t> offsets(groups+1);
+    std::vector<size_t> offsets(person_count+1);
     for (auto& source : sources)
-        (source.*member)[bank].each([&](const T& row){ ++offsets[row.person/BANKS+1]; });
+        (source.shards.*member)[bank].each([&](T& row){
+            row.person=sources[row.person%8].canonical[row.person/8];
+            ++offsets[row.person+1];
+        });
     std::partial_sum(offsets.begin(),offsets.end(),offsets.begin());
     auto cursor = offsets;
     std::vector<T> rows(offsets.back());
     for (auto& source : sources) {
-        auto& input = (source.*member)[bank];
-        input.each([&](const T& row){ rows[cursor[row.person/BANKS]++] = row; });
+        auto& input = (source.shards.*member)[bank];
+        input.each([&](const T& row){ rows[cursor[row.person]++] = row; });
         input.clear();
     }
     return {std::move(rows),std::move(offsets)};
@@ -252,17 +274,19 @@ struct Daily {
     }
 };
 
-void aggregate(size_t bank, std::vector<Shards>& shards, const Dictionary& people,
-               const Catalogs& catalogs, int64_t first_day, size_t days,
-               std::vector<int64_t>& totals, const std::vector<Reader>& readers, const fs::path& out) {
-    auto [events, eoff] = group_by_person(&Shards::events,shards,bank,people.names.size());
-    auto [clicks, coff] = group_by_person(&Shards::clicks,shards,bank,people.names.size());
+void aggregate(size_t bank, std::vector<Reader>& readers, const Catalogs& catalogs,
+               int64_t first_day, size_t days, std::vector<int64_t>& totals, const fs::path& out) {
+    Dictionary people;
+    for (auto& r:readers)
+        for (auto i:r.ids_by_bank[bank]) r.canonical[i]=people.intern(r.names[i]);
+    auto [events, eoff] = group_by_person(&Shards::events,readers,bank,people.names.size());
+    auto [clicks, coff] = group_by_person(&Shards::clicks,readers,bank,people.names.size());
     Daily daily(catalogs.categories);
     std::vector<int64_t> st, revenue, ct;
     std::vector<uint32_t> sp, cp, campaign;
     for (size_t group = 0; group+1 < eoff.size(); ++group) {
         if (eoff[group] == eoff[group+1]) continue;
-        uint32_t person = group*BANKS + bank;
+        uint32_t person = group;
         auto first = events.begin()+eoff[group], last = events.begin()+eoff[group+1];
         std::sort(first,last,[](const Event& a,const Event& b){return a.time < b.time;});
         int64_t previous = 0;
@@ -316,11 +340,17 @@ int main(int argc,char** argv) try {
     for (auto& file:events.mappings) bytes+=file.size;
     {
         RepeatFilter repeats(bytes);
-        parallel(events.chunks.size(),[&](int,size_t i){repeats.scan(events.chunks[i]);});
+        parallel(events.chunks.size()+1,[&](int,size_t i){
+            if (i) repeats.scan(events.chunks[i-1]);
+            else {
+                for (auto chunk:links.chunks) parse_chunk<2>(chunk,[&](auto& f){people.join(f[0],f[1]);});
+                for (uint32_t j=0;j<people.parent.size();++j) people.parent[j]=people.root(j);
+            }
+        });
         repeats.seen.clear(); repeats.seen.shrink_to_fit();
         stage("indexed event IDs");
         parallel(events.chunks.size(),[&](int w,size_t i){
-            read_events(readers[w],w,events.chunks[i],catalogs,repeats,start,end);
+            read_events(readers[w],w,events.chunks[i],catalogs,people,repeats,start,end);
         });
     }
     parallel(BANKS,[&](int w,size_t bank){dedup(bank,readers[w],readers);});
@@ -332,32 +362,23 @@ int main(int argc,char** argv) try {
             int64_t t=r.calendar.timestamp(f[3]);
             if (t<start-7*DAY_MS || t>=end) return;
             uint32_t c=catalogs.campaigns.lookup(f[2]);
-            if (c!=NONE) r.clicks.add({t,f[0],uint32_t(r.users.intern(f[1])*8+w),c});
+            if (c!=NONE) {
+                uint32_t id=local_user(r,f[1],people);
+                r.shards.clicks[r.banks[id]].add({t,f[0],uint32_t(id*8+w),c});
+            }
         });
     });
-    for (auto chunk:links.chunks) parse_chunk<2>(chunk,[&](auto& f){people.join(f[0],f[1]);});
     for (auto& r:readers) {
-        r.canonical.reserve(r.users.names.size());
-        for (Text name:r.users.names) r.canonical.push_back(people.root(people.ids.intern(name)));
+        r.canonical.resize(r.names.size());
         r.users=Dictionary{};
     }
     stage("resolved users and clicks");
-    std::vector<Shards> shards(workers);
-    auto route=[&](auto row,auto& dest){
-        row.person=readers[row.person%8].canonical[row.person/8];
-        dest[row.person%BANKS].add(row);
-    };
-    parallel(workers,[&](int,size_t i){
-        auto& r=readers[i]; auto& dest=shards[i];
-        r.events.each([&](Event e){route(e,dest.events);}); r.events.clear();
-        r.clicks.each([&](Click c){route(c,dest.clicks);}); r.clicks.clear();
-    });
     int64_t first_day=utc_day(start);
     size_t days=utc_day(end-1)-first_day+1;
     size_t metrics=(catalogs.campaigns.names.size()+1)*days*4;
     std::vector<std::vector<int64_t>> totals(workers,std::vector<int64_t>(metrics));
     parallel(BANKS,[&](int w,size_t bank){
-        aggregate(bank,shards,people.ids,catalogs,first_day,days,totals[w],readers,out);
+        aggregate(bank,readers,catalogs,first_day,days,totals[w],out);
     });
     for(int w=1;w<workers;++w)
         for(size_t k=0;k<metrics;++k) totals[0][k]+=totals[w][k];
